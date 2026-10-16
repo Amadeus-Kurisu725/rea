@@ -53,8 +53,14 @@ export const buildJavaScriptApplicationChangeGraph = (
     ({ source_node_id: source, target_node_id: target }) =>
       retained.has(source) && retained.has(target),
   );
+  const leftById = new Map(
+    input.left.nodes.map((node) => [node.node_id, node]),
+  );
+  const rightById = new Map(
+    input.right.nodes.map((node) => [node.node_id, node]),
+  );
   const comparisonEdges = input.items.flatMap((item) =>
-    changedFromEdge(item, input, retained),
+    changedFromEdge(item, input, retained, leftById, rightById),
   );
   const candidateEdges = uniqueEdges([...sourceEdges, ...comparisonEdges]);
   const rootNodeIds = preferredRoots.filter((nodeId) => retained.has(nodeId));
@@ -104,6 +110,8 @@ const changedFromEdge = (
   item: ApplicationVersionComparisonItem,
   input: ChangeGraphInput,
   retained: ReadonlySet<string>,
+  leftById: ReadonlyMap<string, ApplicationNode>,
+  rightById: ReadonlyMap<string, ApplicationNode>,
 ): ApplicationEdge[] => {
   const left = item.left_node_id;
   const right = item.right_node_id;
@@ -117,7 +125,12 @@ const changedFromEdge = (
     !retained.has(right)
   )
     return [];
-  const evidence = comparisonEvidence(item, input);
+  const evidence = comparisonEvidence(
+    item,
+    input,
+    leftById.get(left),
+    rightById.get(right),
+  );
   return [
     createJavaScriptApplicationEdge({
       source_node_id: right,
@@ -138,13 +151,9 @@ const changedFromEdge = (
 const comparisonEvidence = (
   item: ApplicationVersionComparisonItem,
   input: ChangeGraphInput,
+  left: ApplicationNode | undefined,
+  right: ApplicationNode | undefined,
 ): ApplicationGraphEvidence => {
-  const right = input.right.nodes.find(
-    ({ node_id: id }) => id === item.right_node_id,
-  );
-  const left = input.left.nodes.find(
-    ({ node_id: id }) => id === item.left_node_id,
-  );
   const source =
     right?.observations[0]?.evidence ?? left?.observations[0]?.evidence;
   const complete =
@@ -171,7 +180,12 @@ const comparisonEvidence = (
       executable_sha256: null,
     },
     coverage: complete
-      ? { status: "complete", truncated: false, omitted_count: 0, limits: [] }
+      ? {
+          status: "complete",
+          truncated: false,
+          omitted_count: 0,
+          limits: sourceCoverageLimits(input),
+        }
       : {
           status: "partial",
           truncated:
@@ -201,7 +215,7 @@ const changeGraphCoverage = (
       status: "complete",
       truncated: false,
       omitted_count: 0,
-      limits: [],
+      limits: sourceCoverageLimits(input),
     };
   return {
     status: "partial",

@@ -138,6 +138,8 @@ const inventoryEvidence = (
         occurrences: sortedOccurrences,
         edges: [],
         provenance: [],
+        integrity_contradictions: [],
+        coverage: { scope: "container-entries", status: "complete" },
         limitations: [],
       }),
     },
@@ -416,6 +418,34 @@ describe("Apple bundle layouts and containers", () => {
   });
 });
 
+describe("Apple IPA components", () => {
+  it("excludes AppleDouble sidecars from IPA components", () => {
+    const result = project(
+      inventoryEvidence("ipa", "Fixture.ipa", [
+        { path: "Payload/Fixture.app/Info.plist" },
+        macho("Payload/Fixture.app/Fixture"),
+        { path: "Payload/Fixture.app/Contents/Resources/._libfoo.dylib" },
+        { path: "Payload/Fixture.app/Frameworks/Foo.framework/._Foo" },
+        { path: "__MACOSX/Payload/Fixture.app/libghost.dylib" },
+        macho("Payload/Fixture.app/Contents/Resources/libreal.dylib"),
+        macho("SwiftSupport/iphoneos/libswiftCore.dylib"),
+      ]),
+    );
+    expect(result.components.native_libraries.map(({ path }) => path)).toEqual([
+      "Payload/Fixture.app/Contents/Resources/libreal.dylib",
+      "SwiftSupport/iphoneos/libswiftCore.dylib",
+    ]);
+    expect(result.components.frameworks).toEqual([]);
+    expect(result.components.executables.map(({ path }) => path)).toEqual([
+      "Payload/Fixture.app/Contents/Resources/libreal.dylib",
+      "Payload/Fixture.app/Fixture",
+    ]);
+    expect(result.limitations).toContainEqual(
+      expect.stringContaining("AppleDouble sidecar entries"),
+    );
+  });
+});
+
 describe("macOS application scope", () => {
   it("attributes only components inside the application roots", () => {
     const result = project(
@@ -571,4 +601,136 @@ describe("Apple application bridge candidates", () => {
       status: "complete",
     });
   });
+
+  it("keeps an extensionless Mach-O without an application root as a native component", () => {
+    const result = project(
+      inventoryEvidence("ipa", "Fixture.ipa", [
+        { path: "Payload/Fixture.app/Info.plist" },
+        macho("Payload/Fixture.app/Fixture"),
+        { path: "SwiftSupport/outside.js", format: "javascript-bundle" },
+        macho("SwiftSupport/HelperTool"),
+        macho("SwiftSupport/iphoneos/libswiftCore.dylib"),
+      ]),
+    );
+
+    expect(result.components.executables.map(({ path }) => path)).toEqual([
+      "Payload/Fixture.app/Fixture",
+      "SwiftSupport/HelperTool",
+    ]);
+    expect(result.bridge_candidates).toEqual([
+      {
+        source_path: "SwiftSupport/outside.js",
+        native_path: "SwiftSupport/HelperTool",
+        basis: "javascript-and-native-content",
+      },
+      {
+        source_path: "SwiftSupport/outside.js",
+        native_path: "SwiftSupport/iphoneos/libswiftCore.dylib",
+        basis: "javascript-and-native-content",
+      },
+    ]);
+  });
+});
+
+describe("Apple path conventions", () => {
+  it("recognizes anatomy names by English case and reports the archive spelling", () => {
+    const result = project(
+      inventoryEvidence("directory", "Fixture.app", [
+        { path: "contents/info.plist" },
+        macho("contents/macos/Fixture"),
+        { path: "contents/_codesignature/coderesources" },
+      ]),
+    );
+    expect(result.bundles[0]).toMatchObject({
+      layout: "macos-deep",
+      info_plist_path: "contents/info.plist",
+      executable_candidates: ["contents/macos/Fixture"],
+      signing_paths: ["contents/_codesignature/coderesources"],
+    });
+    expect(result.components.bundle_metadata.map(({ path }) => path)).toEqual([
+      "contents/info.plist",
+    ]);
+    expect(result.components.signing.map(({ path }) => path)).toEqual([
+      "contents/_codesignature/coderesources",
+    ]);
+  });
+
+  it("limits runtime families and bridge bases to path segments", () => {
+    const result = project(
+      inventoryEvidence("ipa", "Fixture.ipa", [
+        { path: "Payload/Fixture.app/Info.plist" },
+        macho("Payload/Fixture.app/Fixture"),
+        macho("Payload/Fixture.app/Frameworks/libfoo.dylib"),
+        macho("SwiftSupport/libswiftCore.dylib"),
+        macho("Payload/Fixture.app/Frameworks/MyApp.framework/MyApp"),
+        macho("Payload/Fixture.app/community/libcommunity.so"),
+        {
+          path: "Payload/Fixture.app/main.js",
+          format: "javascript-bundle",
+        },
+      ]),
+    );
+    expect(result.runtime_families).toEqual(
+      expect.arrayContaining(["javascript", "native", "swift-objective-c"]),
+    );
+    expect(result.runtime_families).not.toContain("flutter");
+    expect(result.runtime_families).not.toContain("unity");
+    expect(result.runtime_families).not.toContain("react-native");
+    expect(
+      result.bridge_candidates.every(
+        ({ basis }) => basis === "javascript-and-native-content",
+      ),
+    ).toBe(true);
+    expect(result.limitations).toEqual(
+      expect.arrayContaining([
+        "Runtime families are inferred from inventory formats and bounded framework path conventions, not observed runtime loading.",
+        "A bridge basis is inferred from the native path and is repeated for every managed component.",
+      ]),
+    );
+  });
+
+  it("recognizes framework segments and does not treat a bare dylib as Swift", () => {
+    const result = project(
+      inventoryEvidence("ipa", "Fixture.ipa", [
+        { path: "Payload/Fixture.app/Info.plist" },
+        macho("Payload/Fixture.app/Fixture"),
+        macho("Payload/Fixture.app/Frameworks/Flutter.framework/Flutter"),
+        macho(
+          "Payload/Fixture.app/Frameworks/UnityFramework.framework/UnityFramework",
+        ),
+        macho("Payload/Fixture.app/Frameworks/hermes.framework/hermes"),
+        macho("Payload/Fixture.app/Frameworks/libfoo.dylib"),
+      ]),
+    );
+    expect(result.runtime_families).toEqual(
+      expect.arrayContaining(["flutter", "unity", "react-native", "native"]),
+    );
+    expect(result.runtime_families).not.toContain("swift-objective-c");
+  });
+
+  it.each([
+    // U+10000 sorts before U+FFFD by UTF-16 code unit, after it by code point.
+    ["an astral and a BMP name", "\uFFFD", "\u{10000}"],
+    ["two BMP names", "\uE000", "\uFFFD"],
+  ])(
+    "orders roots, bundles and symlinks by code point for %s",
+    (_label, low, high) => {
+      const result = project(
+        inventoryEvidence(
+          "zip",
+          "Fixture.zip",
+          [high, low].flatMap((name) => [
+            { path: `A${name}.app/Contents/Info.plist` },
+            { path: `A${name}.app/Contents/Resources/link`, kind: "symlink" },
+          ]),
+        ),
+      );
+      const roots = [`A${low}.app`, `A${high}.app`];
+      expect(result.application_roots).toEqual(roots);
+      expect(result.bundles.map(({ path }) => path)).toEqual(roots);
+      expect(result.symlinks).toEqual(
+        roots.map((root) => `${root}/Contents/Resources/link`),
+      );
+    },
+  );
 });

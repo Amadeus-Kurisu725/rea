@@ -2,11 +2,21 @@
 
 REA can attach to an Electron/Chromium CDP endpoint and inspect existing `file://` renderer pages without evaluating JavaScript or invoking Electron APIs. The request supplies the endpoint directly; REA accepts only literal-port loopback HTTP endpoints. Selecting an endpoint exposes every Electron target it serves, including local file paths and page metadata.
 
+Disconnecting the inspection's page session can clear caller-owned
+`navigator.platform` emulation inside Chromium. REA cannot restore another
+client's complete user-agent/client-hint configuration. Use a disposable target
+or let the owning client reapply its configuration; see the shared
+[CDP state limitation](browser-observation.md#provider-authorities).
+
 This passive runtime surface is distinct from the target-free static
 [`analyze_javascript_application`](javascript-artifact-reconstruction.md)
 workflow. Static analysis reads a local ASAR or extracted directory without
 executing application code. Passive observation inspects an existing Electron
 page. The results keep static inferences and runtime observations distinct.
+Packaged fuse state is a separate static read:
+[`inspect_electron_fuses`](electron-fuses.md) reports whether this binary will
+honor Inspector flags, `ELECTRON_RUN_AS_NODE`, embedded ASAR integrity, and
+`app.asar`-only loading.
 Use the separate
 [`reconcile_javascript_runtime`](javascript-runtime-reconciliation.md) workflow
 when both Evidence sets already exist.
@@ -15,7 +25,11 @@ when both Evidence sets already exist.
 
 The request supplies a literal-port loopback endpoint and, for inspection, a
 target ID. REA accepts local hostless `file://` URLs that resolve to regular
-files; remote hosts, encoded path separators, and nonexistent paths are
+files, including pages a packaged application serves from inside `app.asar`.
+For those, the first `.asar` path component that is a regular file is the
+archive, the remainder must name a regular file in its header, and the reported
+path is the canonical archive path joined with that member. Remote hosts,
+encoded path separators, ASAR directories or links, and nonexistent paths are
 rejected. The endpoint exposes every eligible target and its local path
 metadata.
 
@@ -108,6 +122,12 @@ If cleanup cannot be verified, the error retains collected observations in
 `details.partial_observation` and marks their application cleanup `unverified`.
 Cleanup uncertainty does not authorize signaling unrelated processes.
 
+### Target fuse prerequisites
+
+Active scenario capture requires that the target Electron executable honors Node CLI inspector flags (`--inspect` or `--remote-debugging-port`) so that Playwright can establish its DevTools protocol session.
+
+When an Electron executable explicitly disables the `EnableNodeCliInspectArguments` fuse (or removes the capability), `capture-electron-scenario` fails immediately before process launch with an `AnalysisUnsupportedTargetError` ("unsupported_target") rather than waiting for the startup deadline. For targets with disabled inspector fuses, use passive CDP inspection via `inspect_electron_page` or run against an unrestricted development binary with the extracted `app.asar`.
+
 The real verifier exercises compiled CLI and stdio MCP discovery, page/script
 inspection, static/runtime reconciliation, active observation, and CLI SIGTERM
 cleanup before checking the IPC, renderer crash/reload, utility/child-process,
@@ -120,3 +140,5 @@ projection is intentionally target-only and partial: it binds the selected
 application path and capture outcome to the static graph, while frames, scripts,
 workers, and execution claims remain unavailable until a separate passive runtime
 capture provides them.
+
+ASAR observation reads the header through one open file handle, validates its declared lengths against the archive size, and limits encoded JSON headers to 16 MiB before parsing. The header cache also retains at most 16 MiB of encoded headers across eight archives. Oversized headers produce a scope refusal.

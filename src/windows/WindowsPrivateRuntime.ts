@@ -1,6 +1,8 @@
 import { win32 } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 
 import { z } from "zod";
+import { PrivateRuntimeRootUnavailableError } from "../process/PrivateRuntimeRootUnavailableError.js";
 
 import {
   requireWindowsNativeAuthority,
@@ -23,6 +25,19 @@ const fileSchema = windowsFileIdentitySchema.extend({
   handle: windowsHandleSchema,
 });
 const runtimes = new Map<string, WindowsPrivateRuntime>();
+// Retry only a proven pre-allocation sharing/lock conflict, never opaque text
+// or an operation that may already own an unpublished runtime directory.
+const transientRuntimeAdmissionSchema = z.object({
+  code: z.literal("ERR_REA_WINDOWS_NATIVE"),
+  win32Code: z.union([z.literal(32), z.literal(33)]),
+  runtimeAllocation: z.literal("not-started"),
+});
+const transientRuntimeCleanupSchema = z.object({
+  code: z.literal("ERR_REA_WINDOWS_NATIVE"),
+  win32Code: z.union([z.literal(32), z.literal(33)]),
+});
+const RUNTIME_CLEANUP_ATTEMPTS = 10;
+const RUNTIME_CLEANUP_RETRY_DELAY_MS = 100;
 
 /** Retain private DACL and path handles until native recursive cleanup settles. */
 export class WindowsPrivateRuntime {
@@ -40,11 +55,23 @@ export class WindowsPrivateRuntime {
   /** Create a new directory with its private DACL installed at creation. */
   static create(parent: string, prefix: string): WindowsPrivateRuntime {
     const authority = requireWindowsNativeAuthority();
-    const observation = runtimeSchema.parse(
-      authority.call("runtime_create", [parent, prefix]),
-    );
+    let observed: unknown;
+    try {
+      observed = authority.call("runtime_create", [parent, prefix]);
+    } catch (cause: unknown) {
+      if (
+        cause instanceof Error &&
+        transientRuntimeAdmissionSchema.safeParse(cause).success
+      )
+        throw new PrivateRuntimeRootUnavailableError(cause.message, {
+          cause,
+          retryable: true,
+        });
+      throw cause;
+    }
+    const observation = runtimeSchema.parse(observed);
     const runtime = new WindowsPrivateRuntime(observation, authority);
-    runtimes.set(observation.path.toLowerCase(), runtime);
+    runtimes.set(windowsRuntimeIdentityKey(observation), runtime);
     return runtime;
   }
 
@@ -140,18 +167,51 @@ export class WindowsPrivateRuntime {
     if (this.#pending !== undefined)
       this.authority.call("runtime_snapshot_cancel", [this.observation.handle]);
     await this.#pending?.catch(() => undefined);
-    this.authority.call("runtime_close", [this.observation.handle]);
+    await this.#closeRuntime();
     this.#closed = true;
-    runtimes.delete(this.observation.path.toLowerCase());
+    runtimes.delete(windowsRuntimeIdentityKey(this.observation));
+  }
+
+  async #closeRuntime(): Promise<void> {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        this.authority.call("runtime_close", [this.observation.handle]);
+        return;
+      } catch (cause: unknown) {
+        if (
+          attempt >= RUNTIME_CLEANUP_ATTEMPTS ||
+          !transientRuntimeCleanupSchema.safeParse(cause).success
+        )
+          throw cause;
+        // Native cleanup retains the same owned root and permits only another
+        // close after a failed walk. Retry that owner operation briefly when
+        // Windows reports a sharing/lock conflict; other errors remain final.
+        await delay(RUNTIME_CLEANUP_RETRY_DELAY_MS);
+      }
+    }
   }
 }
 
-/** Select an already-owned runtime; an arbitrary pathname cannot grant authority. */
+/** File id returned by the OS. Path spelling is not part of the lease key. */
+const windowsRuntimeIdentityKey = (identity: {
+  readonly volumeSerial: string;
+  readonly fileId: string;
+}): string => `${identity.volumeSerial}:${identity.fileId}`;
+
+/**
+ * Select an already-owned runtime. Only the observed `path` or `finalPath`
+ * matches, character for character. A case variant fails closed.
+ */
 export const windowsPrivateRuntime = (
   rootPath: string,
 ): WindowsPrivateRuntime => {
-  const runtime = runtimes.get(rootPath.toLowerCase());
-  if (runtime === undefined)
+  const matches = [...runtimes.values()].filter(
+    (runtime) =>
+      runtime.observation.finalPath === rootPath ||
+      runtime.observation.path === rootPath,
+  );
+  const runtime = matches[0];
+  if (matches.length !== 1 || runtime === undefined)
     throw new Error(`No native private runtime owns ${rootPath}`);
   return runtime;
 };
